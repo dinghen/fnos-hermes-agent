@@ -1106,7 +1106,17 @@ function _moduleLevelAutoRegisterMcp() {
     let st = {};
     try { if (existsSync(CONNECTORS_STATE)) st = JSON.parse(readFileSync(CONNECTORS_STATE, "utf8") || "{}"); } catch (e) {}
     let yml = "";
-    try { if (existsSync(HERMES_CONFIG)) yml = readFileSync(HERMES_CONFIG, "utf8"); } catch (e) {}
+    let configRead = false;
+    try {
+      if (existsSync(HERMES_CONFIG)) {
+        yml = readFileSync(HERMES_CONFIG, "utf8");
+        configRead = true;
+      }
+    } catch (e) {}
+    if (existsSync(HERMES_CONFIG) && !configRead) {
+      log("[MCP-BRIDGE] refuse to write: unable to read existing config.yaml");
+      return;
+    }
     const nodeBin = resolvedNodeBin || "node";
     const connObj = {};
     CONNECTOR_CATALOG.forEach(function (cat) {
@@ -6784,73 +6794,23 @@ async function handleFetch(req) {
   // 解析现有 mcp_servers 顶层映射块为 { name: {url, headers:{...}, env:{...}} }
   // 支持嵌套 map（headers/env 子块）与列表（args），自适应子块类型
   function _parseMcpServers(yml){
-    const block = _yamlBlockOf(String(yml || "").replace(/\r\n?/g, "\n"), "mcp_servers");
-    const obj = {};
-    if (!block.trim()) return obj;
-    const lines = block.split("\n");
-    let curName = null, curEntry = null, inMap = null, nestedMap = null;
-    for (let lineIndex = 0; lineIndex < lines.length; lineIndex++){
-      const line = lines[lineIndex];
-      // 顶层条目（2 空格缩进 name:）
-      const nm = line.match(/^  ([A-Za-z0-9_-]+):\s*$/);
-      if (nm){
-        if (curName) obj[curName] = curEntry;
-        curName = nm[1]; curEntry = {}; inMap = null; nestedMap = null; continue;
-      }
-      // 8 空格 - item（嵌套 map 中的序列）
-      const nli = line.match(/^        -\s*(.*)$/);
-      if (nli && curEntry && inMap && nestedMap){
-        const list = curEntry[inMap][nestedMap];
-        if (!Array.isArray(list)) curEntry[inMap][nestedMap] = [];
-        curEntry[inMap][nestedMap].push(_yamlUnquote(nli[1].trim()));
-        continue;
-      }
-      // 4 空格 key:（条目字段；v 为空 → 子块，暂存 null 由后续行确定类型）
-      const sk = line.match(/^    ([A-Za-z0-9_-]+):\s*(.*)$/);
-      if (sk && curName && curEntry){
-        const k = sk[1], v = sk[2].trim();
-        inMap = null; nestedMap = null;
-        if (v === ""){ curEntry[k] = null; inMap = k; }
-        else { curEntry[k] = v; }
-        continue;
-      }
-      // 6 空格 key: value（子 map 成员：headers/env 等）
-      const hk = line.match(/^      ([A-Za-z0-9_-]+):\s*(.*)$/);
-      if (hk && curEntry && inMap){
-        if (curEntry[inMap] === null || curEntry[inMap] === undefined) curEntry[inMap] = {};
-        if (curEntry[inMap] && typeof curEntry[inMap] === "object" && !Array.isArray(curEntry[inMap])) {
-          const v = hk[2].trim();
-          const nextLine = lines[lineIndex + 1] || "";
-          curEntry[inMap][hk[1]] = v === "" && /^        -\s/.test(nextLine) ? [] : (v === "" ? {} : _yamlUnquote(v));
-          nestedMap = hk[1];
-          continue;
-        }
-        else if (Array.isArray(curEntry[inMap])) curEntry[inMap] = {};
-        let hv = hk[2].trim();
-        if ((hv.startsWith('"') && hv.endsWith('"')) || (hv.startsWith("'") && hv.endsWith("'"))) hv = hv.slice(1, -1);
-        curEntry[inMap][hk[1]] = hv;
-        nestedMap = null;
-        continue;
-      }
-      // 6 空格 - item（子列表成员：args 等）
-      const li = line.match(/^      -\s*(.*)$/);
-      if (li && curEntry && inMap){
-        if (curEntry[inMap] === null || curEntry[inMap] === undefined) curEntry[inMap] = [];
-        else if (!Array.isArray(curEntry[inMap])) curEntry[inMap] = [];
-        let val = li[1].trim();
-        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) val = val.slice(1, -1);
-        curEntry[inMap].push(val);
-        nestedMap = null;
-        continue;
-      }
-    }
-    if (curName) obj[curName] = curEntry;
-    return obj;
+    // Keep the control-plane parser identical to the startup auto-register parser.
+    // A null result means the existing block is non-empty but not safely understood;
+    // callers must refuse a write instead of replacing it with an empty map.
+    return _moduleParseMcpServers(yml);
   }
   // 合并写入 mcp_servers（保留用户其它条目，仅增/改/删本连接器对应项）
   function _upsertMcpServer(name, entry){
-    let yml = _readHermesConfig();
+    const configPath = _runtimeConfigPath();
+    let yml = "";
+    if (configPath && existsSync(configPath)) {
+      try { yml = readFileSync(configPath, "utf8"); }
+      catch (_) { throw new Error("无法读取现有配置，已拒绝改写"); }
+    } else {
+      yml = _readHermesConfig();
+    }
     const obj = _parseMcpServers(yml);
+    if (obj === null) throw new Error("无法安全解析现有 mcp_servers 配置，已拒绝改写");
     if (entry == null) delete obj[name];
     else obj[name] = entry;
     yml = _setYamlMapBlock(yml, "mcp_servers", obj);
